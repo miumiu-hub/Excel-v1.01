@@ -1,0 +1,1172 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Excel データ整形ツール</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<script>
+/*
+ * Excel データ整形ツール — 整形ロジック
+ * すべてブラウザ内で処理し、外部には一切送信しない。
+ */
+(function (global) {
+  'use strict';
+
+  const PREFECTURES = [
+    '北海道', '青森県', '岩手県', '宮城県', '秋田県', '山形県', '福島県',
+    '茨城県', '栃木県', '群馬県', '埼玉県', '千葉県', '東京都', '神奈川県',
+    '新潟県', '富山県', '石川県', '福井県', '山梨県', '長野県', '岐阜県',
+    '静岡県', '愛知県', '三重県', '滋賀県', '京都府', '大阪府', '兵庫県',
+    '奈良県', '和歌山県', '鳥取県', '島根県', '岡山県', '広島県', '山口県',
+    '徳島県', '香川県', '愛媛県', '高知県', '福岡県', '佐賀県', '長崎県',
+    '熊本県', '大分県', '宮崎県', '鹿児島県', '沖縄県',
+  ];
+
+  // 都道府県が省略されていても市名から補完できる政令指定都市
+  const DESIGNATED_CITIES = {
+    '札幌市': '北海道', '仙台市': '宮城県', 'さいたま市': '埼玉県', '千葉市': '千葉県',
+    '横浜市': '神奈川県', '川崎市': '神奈川県', '相模原市': '神奈川県', '新潟市': '新潟県',
+    '静岡市': '静岡県', '浜松市': '静岡県', '名古屋市': '愛知県', '京都市': '京都府',
+    '大阪市': '大阪府', '堺市': '大阪府', '神戸市': '兵庫県', '岡山市': '岡山県',
+    '広島市': '広島県', '北九州市': '福岡県', '福岡市': '福岡県', '熊本市': '熊本県',
+  };
+
+  const TOKYO_WARDS = [
+    '千代田区', '中央区', '港区', '新宿区', '文京区', '台東区', '墨田区', '江東区',
+    '品川区', '目黒区', '大田区', '世田谷区', '渋谷区', '中野区', '杉並区', '豊島区',
+    '北区', '荒川区', '板橋区', '練馬区', '足立区', '葛飾区', '江戸川区',
+  ];
+
+  // 名前に「市」「郡」を含むため、単純な規則だと誤って区切ってしまう市
+  const TRICKY_CITIES = [
+    '大和郡山市', '四日市市', '廿日市市', '野々市市', '蒲郡市', '小郡市', '郡山市', '市川市', '市原市',
+  ];
+
+  const LEGAL_ABBR = { '株': '株式会社', '有': '有限会社', '同': '合同会社', '資': '合資会社', '名': '合名会社' };
+  const LEGAL_SHORT = Object.fromEntries(Object.entries(LEGAL_ABBR).map(([k, v]) => [v, `（${k}）`]));
+  const LEGAL_FORMS = Object.values(LEGAL_ABBR);
+  const LEGAL_FORMS_RE = new RegExp(LEGAL_FORMS.join('|'), 'g');
+  const LEGAL_FORMS_SPACED_RE = new RegExp(`\\s*(${LEGAL_FORMS.join('|')})\\s*`, 'g');
+
+  // ISO 3166-1 alpha-2 と、よく使われる別名（英語・日本語・3文字コード）
+  const COUNTRIES = {
+    JP: ['japan', '日本', '日本国', 'jpn', 'nippon'],
+    US: ['usa', 'us', 'united states', 'united states of america', 'america', 'アメリカ', '米国', 'アメリカ合衆国'],
+    CN: ['china', '中国', '中華人民共和国', 'chn', 'prc'],
+    KR: ['korea', 'south korea', 'republic of korea', '韓国', '大韓民国', 'kor'],
+    TW: ['taiwan', '台湾', 'twn'],
+    HK: ['hong kong', 'hongkong', '香港', 'hkg'],
+    SG: ['singapore', 'シンガポール', 'sgp'],
+    TH: ['thailand', 'タイ', 'tha'],
+    VN: ['vietnam', 'viet nam', 'ベトナム', 'vnm'],
+    PH: ['philippines', 'フィリピン', 'phl'],
+    ID: ['indonesia', 'インドネシア', 'idn'],
+    MY: ['malaysia', 'マレーシア', 'mys'],
+    IN: ['india', 'インド', 'ind'],
+    GB: ['uk', 'united kingdom', 'great britain', 'england', 'イギリス', '英国', 'gbr'],
+    DE: ['germany', 'ドイツ', 'deu'],
+    FR: ['france', 'フランス', 'fra'],
+    IT: ['italy', 'イタリア', 'ita'],
+    ES: ['spain', 'スペイン', 'esp'],
+    NL: ['netherlands', 'holland', 'オランダ', 'nld'],
+    CH: ['switzerland', 'スイス', 'che'],
+    SE: ['sweden', 'スウェーデン', 'swe'],
+    CA: ['canada', 'カナダ', 'can'],
+    MX: ['mexico', 'メキシコ', 'mex'],
+    BR: ['brazil', 'ブラジル', 'bra'],
+    AU: ['australia', 'オーストラリア', 'aus'],
+    NZ: ['new zealand', 'ニュージーランド', 'nzl'],
+  };
+  const COUNTRY_INDEX = new Map();
+  for (const [code, names] of Object.entries(COUNTRIES)) {
+    COUNTRY_INDEX.set(code.toLowerCase(), code);
+    names.forEach((n) => COUNTRY_INDEX.set(n, code));
+  }
+
+  const ADDRESS_PARTS = [
+    ['postal', '郵便番号'], ['pref', '都道府県'], ['city', '市区町村'],
+    ['town', '町域'], ['banchi', '番地'], ['building', '建物名'],
+  ];
+
+  const KANJI_DIGITS = { '〇': 0, '一': 1, '二': 2, '三': 3, '四': 4, '五': 5, '六': 6, '七': 7, '八': 8, '九': 9 };
+  const JAPANESE_RE = /[぀-ヿ㐀-鿿]/;
+  // 「値がない」ことを表す書き方。空欄に揃える
+  const MISSING_RE = /^(?:[-‐‑‒–—―−ｰー－]+|n\/?a|#n\/a|null|none|nil|なし|無し|不明|未設定|未入力|該当なし)$/i;
+  const ID_RE = /^([A-Z]*)[\s\-_]*(\d+)$/;
+
+  function str(v) {
+    return v == null ? '' : String(v);
+  }
+
+  // 全角英数→半角、半角カナ→全角、㈱→(株) などをまとめて揃える
+  function nfkc(s) {
+    return str(s).normalize('NFKC');
+  }
+
+  function normalizeText(raw) {
+    return nfkc(raw).replace(/\s+/g, ' ').trim();
+  }
+
+  function isMissing(raw) {
+    return MISSING_RE.test(normalizeText(raw));
+  }
+
+  function normalizeDashesBetweenDigits(s) {
+    return s.replace(/(\d)\s*[‐‑‒–—―−ｰー－-]\s*(?=\d)/g, '$1-');
+  }
+
+  function kanjiToNumber(k) {
+    if (k.includes('十')) {
+      const [tens, ones] = k.split('十');
+      return (tens ? KANJI_DIGITS[tens] : 1) * 10 + (ones ? KANJI_DIGITS[ones] : 0);
+    }
+    return Number([...k].map((c) => KANJI_DIGITS[c]).join(''));
+  }
+
+  // 「三丁目」「五番地」の漢数字だけを算用数字にする。「一番町」のような町名は変えない
+  function convertKanjiNumerals(s) {
+    return s.replace(/([〇一二三四五六七八九十]+)(?=丁目|番地|番(?![町丁])|号)/g, (m, k) => {
+      const n = kanjiToNumber(k);
+      return Number.isNaN(n) ? m : String(n);
+    });
+  }
+
+  /* ---------------- 住所 ---------------- */
+
+  // 英語などの住所：「SanJose」→「San Jose」、カンマの後の空白を揃える
+  function formatForeignAddress(s) {
+    return normalizeText(s)
+      .replace(/([a-z])([A-Z])/g, '$1 $2')
+      .replace(/\s*,\s*/g, ', ')
+      .replace(/,\s*$/, '');
+  }
+
+  function splitAddress(raw, opts = {}) {
+    const flags = [];
+    const result = { postal: '', pref: '', city: '', town: '', banchi: '', building: '', flags };
+    let s = normalizeText(raw);
+    if (!s) return result;
+    if (!JAPANESE_RE.test(s)) {
+      result.town = formatForeignAddress(s);
+      return result;
+    }
+
+    s = normalizeDashesBetweenDigits(s);
+    const pm = s.match(/^〒?\s*(\d{3})-?(\d{4})(?!\d)\s*/);
+    if (pm) {
+      result.postal = `${pm[1]}-${pm[2]}`;
+      s = s.slice(pm[0].length);
+    }
+    s = convertKanjiNumerals(s);
+
+    // 番地より前の空白は区切りとして意味がないので除去する（建物名の前の空白は残す）
+    const firstDigit = s.search(/\d/);
+    const headEnd = firstDigit === -1 ? s.length : firstDigit;
+    s = s.slice(0, headEnd).replace(/ /g, '') + s.slice(headEnd);
+
+    let pref = PREFECTURES.find((p) => s.startsWith(p)) || '';
+    if (pref) {
+      s = s.slice(pref.length);
+    } else {
+      // 「神奈川横浜市」のような県の省略。ただし「京都市」「千葉市」は市名なので除外
+      const short = PREFECTURES.find((p) => {
+        if (p === '北海道') return false;
+        const name = p.slice(0, -1);
+        return s.startsWith(name) && !/^[市郡]/.test(s.slice(name.length));
+      });
+      if (short) {
+        pref = short;
+        s = s.slice(short.length - 1);
+        flags.push('都道府県名を補完しました（「都・府・県」の省略）');
+      }
+    }
+
+    let city = TRICKY_CITIES.find((c) => s.startsWith(c)) || '';
+    if (!city && (pref === '東京都' || !pref)) {
+      city = TOKYO_WARDS.find((w) => s.startsWith(w)) || '';
+    }
+    if (!city) {
+      const dc = Object.keys(DESIGNATED_CITIES).find((c) => s.startsWith(c));
+      if (dc) {
+        const ward = s.slice(dc.length).match(/^.+?区/);
+        city = dc + (ward ? ward[0] : '');
+      }
+    }
+    if (!city) {
+      const m = s.match(/^.+?郡.+?[町村]/) || s.match(/^.+?市/) || s.match(/^.+?区/) || s.match(/^.+?[町村]/);
+      if (m) city = m[0];
+    }
+
+    if (!pref) {
+      const base = Object.keys(DESIGNATED_CITIES).find((c) => city.startsWith(c));
+      if (base) {
+        pref = DESIGNATED_CITIES[base];
+        flags.push('都道府県を市名から補完しました');
+      } else if (TOKYO_WARDS.includes(city)) {
+        pref = '東京都';
+        flags.push('都道府県を区名から補完しました');
+      } else {
+        flags.push('都道府県が見つかりません');
+      }
+    }
+    if (!city) flags.push('市区町村を判定できません');
+    s = s.slice(city.length);
+
+    // 札幌などの「北1条西2丁目」は町域の一部として扱う
+    let town = '';
+    const jo = s.match(/^(\D*\d+条(?:[東西南北]?\d+丁目)?)/);
+    if (jo) {
+      town = jo[1];
+      s = s.slice(jo[1].length);
+    }
+
+    let banchi = '';
+    let building = '';
+    const d = s.search(/\d/);
+    if (d === -1) {
+      town += s.trim();
+      flags.push('番地が見つかりません');
+    } else {
+      town += s.slice(0, d).trim();
+      banchi = s.slice(d).match(/^(?:\d+|丁目|番地|番|号|-(?=\d)|の(?=\d))+/)[0];
+      building = s.slice(d + banchi.length).replace(/^[\s,、]+/, '').trim();
+    }
+
+    if (banchi && opts.banchiStyle !== 'keep') {
+      banchi = banchi
+        .replace(/丁目|番地|番|の/g, '-')
+        .replace(/号/g, '')
+        .replace(/-+/g, '-')
+        .replace(/^-|-$/g, '');
+    }
+    const numbers = banchi.match(/\d+/g) || [];
+    if (numbers.length >= 4) flags.push('番地に部屋番号が含まれている可能性があります');
+    if (numbers.length && numbers.every((n) => /^0+$/.test(n))) flags.push('番地が不自然です（0-0-0 など）');
+
+    Object.assign(result, { pref, city, town, banchi, building });
+    return result;
+  }
+
+  // 分割した住所を1つのセル用の文字列に戻す
+  // style 'joined': 〒100-0001 東京都千代田区千代田1-1 ○○ビル
+  // style 'spaced': 〒100-0001 東京都 千代田区 千代田 1-1 ○○ビル
+  function formatAddress(a, style = 'joined') {
+    const postal = a.postal && `〒${a.postal}`;
+    if (style === 'spaced') {
+      return [postal, a.pref, a.city, a.town, a.banchi, a.building].filter(Boolean).join(' ');
+    }
+    return [postal, a.pref + a.city + a.town + a.banchi, a.building].filter(Boolean).join(' ');
+  }
+
+  function isSplitAddress(opts) {
+    return opts.addressStyle === 'split' || opts.splitAddress === true;
+  }
+
+  /* ---------------- 電話番号 ---------------- */
+
+  function formatGroups(digits, lengths) {
+    const out = [];
+    let i = 0;
+    for (const n of lengths) {
+      out.push(digits.slice(i, i + n));
+      i += n;
+    }
+    return out.join('-');
+  }
+
+  function normalizeOnePhone(part, style, flags) {
+    const t = part.replace(/[^\d+()\-\s]/g, ' ').trim();
+    let digits = t.replace(/\D/g, '');
+    let groups = t.match(/\d+/g) || [];
+
+    if (/^\+\s*(?!81)\d/.test(t)) {
+      // 日本以外の国番号付き：国番号を残して区切りだけ揃える
+      return style === 'digits' ? `+${digits}` : `+${groups.join('-')}`;
+    }
+    if (/^\+\s*81/.test(t)) {
+      groups = groups.slice(1);
+      if (groups[0] === '0') groups.shift(); // +81(0)3-... の (0)
+      if (groups.length) groups[0] = '0' + groups[0];
+      digits = groups.join('');
+    } else if (groups.length >= 2 && digits[0] !== '0') {
+      // 408-555-0123 のように区切りがあって0で始まらない番号は、国番号のない海外の番号とみなす
+      flags.push('海外の番号の可能性があります（国番号がありません）');
+      return style === 'digits' ? digits : groups.join('-');
+    } else if ((digits.length === 9 || digits.length === 10) && digits[0] !== '0') {
+      // Excel が数値として扱い、先頭の0が消えたケース
+      digits = '0' + digits;
+      if (groups.length) groups[0] = '0' + groups[0];
+      flags.push('先頭の0を補完しました');
+    }
+
+    const len = digits.length;
+    let lengths = null;
+    if (len === 11 && digits.startsWith('0800')) lengths = [4, 3, 4];
+    else if (len === 10 && /^0(120|570|180|990)/.test(digits)) lengths = [4, 3, 3];
+    else if (len === 11 && /^0[5-9]0/.test(digits)) lengths = [3, 4, 4];
+    else if (len === 10 && /^0[36]/.test(digits)) lengths = [2, 4, 4];
+    else if (len === 10 && digits[0] === '0') {
+      // 市外局番の桁数は地域ごとに違うため、元の区切りが妥当ならそれを使う
+      const validGroups = groups.length === 3 && groups.join('') === digits &&
+        groups[0].length >= 2 && groups[0].length <= 5 && groups[2].length === 4;
+      if (validGroups) {
+        lengths = groups.map((g) => g.length);
+      } else {
+        if (style !== 'digits') flags.push('市外局番の区切りを判定できないため、ハイフンを入れていません');
+        return digits;
+      }
+    } else {
+      flags.push(`桁数が正しくありません（${len}桁）`);
+      return part.trim();
+    }
+    if (/0{8}$/.test(digits)) flags.push('番号が不自然です（0が並んでいます）');
+    return style === 'digits' ? digits : formatGroups(digits, lengths);
+  }
+
+  function normalizePhone(raw, opts = {}) {
+    const style = opts.phoneStyle || 'hyphen';
+    const flags = [];
+    let s = nfkc(raw).trim();
+    if (!s) return { value: '', flags };
+
+    let ext = '';
+    const em = s.match(/\s*\(?\s*(?:内線|ext\.?|内)\s*\)?\s*:?\s*(\d{1,6})\s*\)?\s*$/i);
+    if (em) {
+      ext = em[1];
+      s = s.slice(0, em.index);
+    }
+
+    const parts = s.split(/[\/,、;\n・]|\s+or\s+/i).filter((p) => /\d/.test(p));
+    if (parts.length === 0) {
+      flags.push('番号が見つかりません');
+      return { value: s, flags };
+    }
+    if (parts.length > 1) flags.push('1つのセルに複数の番号が入っています');
+
+    let value = parts.map((p) => normalizeOnePhone(p, style, flags)).join(' / ');
+    if (ext) value += ` 内線${ext}`;
+    return { value, flags };
+  }
+
+  /* ---------------- 会社名・表記ゆれ ---------------- */
+
+  function parseDictionary(text) {
+    return str(text)
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((l) => l && !l.startsWith('#'))
+      .map((l) => l.split(/\s*(?:=>|→|=|\t)\s*/))
+      .filter((p) => p.length >= 2 && p[0])
+      .map((p) => [normalizeText(p[0]), normalizeText(p[1])]);
+  }
+
+  function applyDictionary(s, dict) {
+    let out = s;
+    for (const [from, to] of dict || []) out = out.split(from).join(to);
+    return out;
+  }
+
+  // 法人格を前か後ろに寄せる（「アリバ商事株式会社」⇔「株式会社アリバ商事」）
+  function moveLegalForm(s, position) {
+    const lf = LEGAL_FORMS.join('|');
+    const front = s.match(new RegExp(`^(${lf})(.+)$`));
+    const back = s.match(new RegExp(`^(.+?)(${lf})$`));
+    let form;
+    let name;
+    if (front) [, form, name] = front;
+    else if (back) [, name, form] = back;
+    else return s;
+    return position === 'front' ? form + name : name + form;
+  }
+
+  // style: 'full' → 株式会社 / 'short' → （株）
+  // position: 'keep' → 元の位置 / 'front' → 前 / 'back' → 後ろ
+  function normalizeCompany(raw, dict, style = 'full', position = 'keep') {
+    let s = normalizeText(raw);
+    s = s.replace(/\(\s*([株有同資名])\s*\)/g, (m, k) => LEGAL_ABBR[k]);
+    s = s.replace(LEGAL_FORMS_SPACED_RE, '$1');
+    if (position === 'front' || position === 'back') s = moveLegalForm(s, position);
+    s = applyDictionary(s, dict);
+    if (style === 'short') s = s.replace(LEGAL_FORMS_RE, (f) => LEGAL_SHORT[f]);
+    return s;
+  }
+
+  // 名寄せ用のキー：法人格・空白・記号・大小文字の違いを無視する
+  function companyKey(s) {
+    return normalizeText(s)
+      .replace(LEGAL_FORMS_RE, '')
+      .replace(/\([株有同資名]\)/g, '')
+      .replace(/\b(?:inc|ltd|llc|corp|co)\b\.?/gi, '')
+      .replace(/[\s・.,]/g, '')
+      .toLowerCase();
+  }
+
+  /* ---------------- ID・メール・ステータス・支払条件・国 ---------------- */
+
+  // 列全体を見て、IDの区切り記号と桁数を決める（多数派に合わせる）
+  function analyzeIds(values) {
+    let width = 0;
+    let withSep = 0;
+    let noSep = 0;
+    values.forEach((v) => {
+      const s = nfkc(v).trim().toUpperCase();
+      const m = s.match(ID_RE);
+      if (!m) return;
+      width = Math.max(width, m[2].length);
+      if (/[\s\-_]/.test(s)) withSep++;
+      else noSep++;
+    });
+    return { width, sep: noSep > withSep ? '' : '-' };
+  }
+
+  function normalizeId(raw, format) {
+    const s = nfkc(raw).trim().toUpperCase();
+    const m = s.match(ID_RE);
+    if (!m) return { value: normalizeText(raw), flags: ['IDの形式が他と違います'] };
+    const num = m[2].replace(/^0+(?=\d)/, '').padStart(format.width, '0');
+    return { value: m[1] ? m[1] + format.sep + num : num, flags: [] };
+  }
+
+  function normalizeEmail(raw) {
+    const s = nfkc(raw).replace(/\s+/g, '').toLowerCase();
+    const flags = /^[^@]+@[^@]+\.[a-z]{2,}$/.test(s) ? [] : ['メールアドレスの形式が正しくありません'];
+    return { value: s, flags };
+  }
+
+  // caseStyle: 'title' → Active / 'upper' → ACTIVE / 'lower' → active
+  function normalizeCategory(raw, dict, caseStyle = 'title') {
+    const s = applyDictionary(normalizeText(raw), dict);
+    if (!/[a-z]/i.test(s)) return s;
+    if (caseStyle === 'upper') return s.toUpperCase();
+    if (caseStyle === 'lower') return s.toLowerCase();
+    return s.toLowerCase().replace(/(^|[\s_\-\/])([a-z])/g, (m, p, c) => p + c.toUpperCase());
+  }
+
+  // 「30日」「30」「net 30」「Net30days」→ Net30
+  function normalizePayment(raw) {
+    const s = normalizeText(raw).toLowerCase().replace(/\s+/g, '');
+    const m = s.match(/^(?:net)?(\d{1,3})(?:日|days?|d)?(?:後|以内|払い|サイト)?$/) || s.match(/^(\d{1,3})日/);
+    if (m) return { value: `Net${Number(m[1])}`, flags: [] };
+    return { value: normalizeText(raw), flags: ['支払条件を読み取れません'] };
+  }
+
+  function normalizeCountry(raw) {
+    const key = normalizeText(raw).toLowerCase().replace(/\./g, '').replace(/\s+/g, ' ');
+    const code = COUNTRY_INDEX.get(key);
+    if (code) return { value: code, flags: [] };
+    return { value: normalizeText(raw), flags: ['国名を判定できません'] };
+  }
+
+  /* ---------------- 1セルの整形 ---------------- */
+
+  function convertCell(type, raw, opts = {}, dict = [], idFormat = null) {
+    const v = str(raw);
+    if (!v.trim() || (opts.blankMissing !== false && isMissing(v))) {
+      return { value: '', flags: [], parts: null };
+    }
+    switch (type) {
+      case 'phone': return normalizePhone(v, opts);
+      case 'address': {
+        const a = splitAddress(v, opts);
+        return { value: formatAddress(a, opts.addressStyle), flags: a.flags, parts: a };
+      }
+      case 'company': return { value: normalizeCompany(v, dict, opts.companyStyle, opts.companyPosition), flags: [] };
+      case 'id': return normalizeId(v, idFormat || analyzeIds([v]));
+      case 'email': return normalizeEmail(v);
+      case 'category': return { value: normalizeCategory(v, dict, opts.caseStyle), flags: [] };
+      case 'payment': return normalizePayment(v);
+      case 'country': return normalizeCountry(v);
+      default: return { value: applyDictionary(normalizeText(v), dict), flags: [] };
+    }
+  }
+
+  /* ---------------- 確認が必要な所の分類 ---------------- */
+
+  // fix: 自動では直せなかった（人が直す）／ check: 自動で補った・念のため目で確認
+  const ISSUE_RULES = [
+    [/補完/, 'check', '自動で補った値が正しいか確認してください。'],
+    [/複数の番号/, 'check', '必要な番号を1つに絞るか、列を分けてください。'],
+    [/部屋番号/, 'check', '最後の数字が部屋番号なら、建物名の列へ移してください。'],
+    [/市外局番/, 'fix', '正しい位置にハイフンを入れてください（例：047-123-4567）。'],
+    [/桁数|番号が見つかりません/, 'fix', '番号が欠けていないか、元の資料で確認してください。'],
+    [/同じ/, 'check', '同じものが他の行にもあります。1つにまとめるか、削除するかを決めてください。'],
+    [/海外の番号/, 'check', '国番号（例：アメリカなら +1）を付けるか確認してください。'],
+    [/不自然/, 'fix', '仮の値の可能性があります。元の資料で正しい値を確認してください。'],
+    [/国名/, 'fix', '国コード（JP・US など）に直すか、置き換えリストに登録してください。'],
+    [/支払条件/, 'fix', '「Net30」のような形に直してください。'],
+    [/IDの形式/, 'fix', '他の行と同じ形（例：SUP-001）に直してください。'],
+    [/メールアドレスの形式/, 'fix', '「@」やドメインが正しいか確認してください。'],
+  ];
+
+  function describeIssue(reason) {
+    const rule = ISSUE_RULES.find(([re]) => re.test(reason));
+    if (rule) return { level: rule[1], hint: rule[2] };
+    return { level: 'fix', hint: '住所が正しいか、元の資料で確認してください。' };
+  }
+
+  const LEVEL_LABEL = { fix: '要修正', check: '念のため確認' };
+
+  function worstLevel(flags) {
+    if (!flags.length) return '';
+    return flags.some((f) => describeIssue(f).level === 'fix') ? 'fix' : 'check';
+  }
+
+  /* ---------------- 列の種類の推定 ---------------- */
+
+  function guessColumnType(name, samples = []) {
+    const n = normalizeText(name).toLowerCase();
+    const vals = samples.map(normalizeText).filter((v) => v && !MISSING_RE.test(v));
+    const ratio = (re) => (vals.length ? vals.filter((v) => re.test(v)).length / vals.length : 0);
+    const looksLikeId = ratio(/^[A-Za-z]{0,6}[\s\-_]?\d{1,8}$/) > 0.5;
+
+    if (/電話|tel|携帯|fax|phone/.test(n)) return 'phone';
+    if (/mail|メール/.test(n)) return 'email';
+    if ((/id$|コード|code|番号$/.test(n) && looksLikeId)) return 'id';
+    if (/country|国名|^国$/.test(n)) return 'country';
+    if (/payment|支払|^terms?$/.test(n)) return 'payment';
+    if (/status|ステータス|状態|区分|種別|ランク/.test(n)) return 'category';
+    if (/住所|所在地|address|送付先/.test(n)) return 'address';
+    if (/会社|社名|法人|企業|取引先|仕入先|company|supplier|vendor|customer|client/.test(n)) return 'company';
+
+    if (vals.length) {
+      if (ratio(/@/) > 0.7) return 'email';
+      if (ratio(/^[\d\s()+\-ー]{9,}$/) > 0.7) return 'phone';
+      if (ratio(new RegExp(`^(〒?\\s*\\d{3}-?\\d{4}\\s*)?(${PREFECTURES.join('|')})`)) > 0.5) return 'address';
+      if (vals.filter((v) => COUNTRY_INDEX.has(v.toLowerCase().replace(/\./g, ''))).length / vals.length > 0.7) return 'country';
+    }
+    return 'none';
+  }
+
+  /* ---------------- 表全体の処理 ---------------- */
+
+  // 同じ値が複数行にあれば、それぞれのセルに印をつける
+  function markDuplicates(cells, rowNos, label) {
+    const index = new Map();
+    cells.forEach((c, r) => {
+      if (!c.value) return;
+      if (!index.has(c.value)) index.set(c.value, []);
+      index.get(c.value).push(r);
+    });
+    for (const list of index.values()) {
+      if (list.length < 2) continue;
+      list.forEach((r) => {
+        const others = list.filter((x) => x !== r).map((x) => rowNos[x]).join('・');
+        cells[r].flags = [...cells[r].flags, `同じ${label}が他の行にもあります（${others}行目）`];
+      });
+    }
+  }
+
+  // 既定では列の構成を変えずにセルの中身だけを整える。
+  // opts.keepOriginal: 整形前の列も残す
+  // opts.columnOptions[i]: その列だけの設定（phoneStyle・addressStyle など）。全体の opts より優先
+  function processTable(header, rows, colTypes, opts = {}) {
+    const keepOriginal = opts.keepOriginal === true;
+    const dict = parseDictionary(opts.dictionary);
+    const plan = header.map((h, i) => ({
+      name: str(h).trim() || `列${i + 1}`,
+      type: colTypes[i] || 'none',
+      opts: { ...opts, ...((opts.columnOptions || [])[i] || {}) },
+    }));
+    const rowNos = rows.map((_, r) => (opts.rowNumbers ? opts.rowNumbers[r] : r + 2));
+
+    // 列ごとにまとめて整形する（IDの桁数や重複は列全体を見ないと決められないため）
+    const cols = plan.map((c, i) => {
+      if (c.type === 'none') return null;
+      const values = rows.map((row) => str(row[i]));
+      const idFormat = c.type === 'id' ? analyzeIds(values) : null;
+      const cells = values.map((v) => convertCell(c.type, v, c.opts, dict, idFormat));
+      if (c.type === 'id') markDuplicates(cells, rowNos, 'ID');
+      if (c.type === 'email') markDuplicates(cells, rowNos, 'メールアドレス');
+      return cells;
+    });
+
+    const outHeader = [];
+    for (const c of plan) {
+      if (c.type === 'none' || keepOriginal) outHeader.push(c.name);
+      if (c.type === 'address' && isSplitAddress(c.opts)) {
+        ADDRESS_PARTS.forEach(([, label]) => outHeader.push(`${c.name}_${label}`));
+      } else if (c.type !== 'none') {
+        outHeader.push(keepOriginal ? `${c.name}（整形後）` : c.name);
+      }
+    }
+
+    const outRows = [];
+    const meta = [];
+    const rowFlags = [];
+    const rowLevels = [];
+    const issues = [];
+    const changes = [];
+    const companyIndex = new Map();
+
+    rows.forEach((row, r) => {
+      const rowNo = rowNos[r];
+      const out = [];
+      const m = [];
+      const levels = [];
+
+      plan.forEach((c, i) => {
+        const v = str(row[i]);
+        if (c.type === 'none' || keepOriginal) {
+          out.push(v);
+          m.push(null);
+        }
+        if (c.type === 'none') return;
+
+        const { value: after, flags, parts } = cols[i][r];
+        const changed = after !== v;
+        const level = worstLevel(flags);
+        if (c.type === 'address' && isSplitAddress(c.opts)) {
+          ADDRESS_PARTS.forEach(([k]) => {
+            const part = parts ? parts[k] : '';
+            out.push(part);
+            m.push({ changed: part !== '', before: v, level });
+          });
+        } else {
+          out.push(after);
+          m.push({ changed, before: v, level });
+        }
+        if (changed) changes.push({ row: rowNo, column: c.name, before: v, after });
+        flags.forEach((reason) => {
+          const d = describeIssue(reason);
+          issues.push({ row: rowNo, column: c.name, value: v, reason, level: d.level, hint: d.hint });
+        });
+        if (level) levels.push(level);
+
+        if (c.type === 'company' && after) {
+          const key = `${c.name}\u0000${companyKey(after)}`;
+          if (!companyIndex.has(key)) companyIndex.set(key, { column: c.name, items: [] });
+          companyIndex.get(key).items.push({ row: rowNo, before: v, after });
+        }
+      });
+
+      outRows.push(out);
+      meta.push(m);
+      rowFlags.push(levels.length > 0);
+      rowLevels.push(levels.includes('fix') ? 'fix' : levels.length ? 'check' : '');
+    });
+    issues.sort((a, b) => (a.level === b.level ? 0 : a.level === 'fix' ? -1 : 1));
+
+    const dupGroups = [...companyIndex.values()]
+      .filter((g) => g.items.length >= 2)
+      .map((g) => ({
+        column: g.column,
+        kind: new Set(g.items.map((x) => x.after)).size > 1 ? '表記違い' : '同一表記',
+        items: g.items,
+      }));
+
+    return { header: outHeader, rows: outRows, meta, rowFlags, rowLevels, issues, changes, dupGroups };
+  }
+
+  const api = {
+    ADDRESS_PARTS, LEVEL_LABEL, describeIssue, normalizeText, isMissing, splitAddress, formatAddress,
+    normalizePhone, normalizeCompany, normalizeId, analyzeIds, normalizeEmail, normalizeCategory,
+    normalizePayment, normalizeCountry, convertCell, parseDictionary, applyDictionary, companyKey,
+    guessColumnType, processTable,
+  };
+  global.Cleaner = api;
+  if (typeof module !== 'undefined' && module.exports) module.exports = api;
+})(typeof window !== 'undefined' ? window : globalThis);
+</script>
+<style>
+  :root {
+    --bg: #f6f7f9; --surface: #ffffff; --text: #1d2330; --muted: #5d6675; --border: #dde1e7;
+    --accent: #1f6feb; --accent-text: #ffffff; --changed: #e6f4ea; --changed-text: #14532d;
+    --warn: #fff4d6; --warn-text: #7a4b00; --row-hover: #f0f3f7;
+    --fix: #fde8e8; --fix-text: #8a1c1c; --info: #e8f0fe; --info-text: #1a3f8f;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      --bg: #12151b; --surface: #1b2029; --text: #e6e9ef; --muted: #9aa3b2; --border: #2e3542;
+      --accent: #4c8dff; --accent-text: #0b1020; --changed: #163422; --changed-text: #a7e3b7;
+      --warn: #3a2f12; --warn-text: #f3d48a; --row-hover: #222936;
+      --fix: #3b1717; --fix-text: #f5b5b5; --info: #172a4a; --info-text: #a8c7fa;
+    }
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: "Segoe UI", "Hiragino Sans", "Yu Gothic UI", Meiryo, sans-serif; line-height: 1.6;
+  }
+  header, main { max-width: 1100px; margin: 0 auto; padding: 0 16px; }
+  header { padding-top: 28px; }
+  h1 { font-size: 1.5rem; margin: 0 0 4px; }
+  .lead { color: var(--muted); margin: 0 0 20px; }
+  .card { background: var(--surface); border: 1px solid var(--border); border-radius: 10px; padding: 20px; margin-bottom: 16px; }
+  h2 { font-size: 1.1rem; margin: 0 0 12px; display: flex; align-items: center; gap: 10px; }
+  .num { display: inline-grid; place-items: center; width: 26px; height: 26px; border-radius: 50%; background: var(--accent); color: var(--accent-text); font-size: .85rem; }
+  .muted { color: var(--muted); }
+  small { color: var(--muted); }
+  .drop { display: block; border: 2px dashed var(--border); border-radius: 10px; padding: 28px 16px; text-align: center; cursor: pointer; }
+  .drop.over, .drop:hover { border-color: var(--accent); }
+  .row { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; margin-top: 12px; }
+  button { font: inherit; border-radius: 8px; padding: 8px 16px; cursor: pointer; border: 1px solid var(--border); background: var(--surface); color: var(--text); }
+  button.primary { background: var(--accent); color: var(--accent-text); border-color: var(--accent); font-weight: 600; margin-top: 16px; }
+  button:disabled { opacity: .5; cursor: not-allowed; }
+  select, input[type=number], textarea { font: inherit; color: var(--text); background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 4px 8px; }
+  input[type=number] { width: 72px; }
+  textarea { width: 100%; font-family: Consolas, monospace; font-size: .9rem; }
+  .tablewrap { overflow-x: auto; border: 1px solid var(--border); border-radius: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: .88rem; }
+  th, td { padding: 6px 10px; border-bottom: 1px solid var(--border); text-align: left; white-space: nowrap; }
+  th { position: sticky; top: 0; background: var(--surface); z-index: 1; }
+  tbody tr:hover { background: var(--row-hover); }
+  td.changed { background: var(--changed); color: var(--changed-text); }
+  .lv-check, tr.lv-check td:first-child { background: var(--warn); color: var(--warn-text); }
+  .lv-fix, tr.lv-fix td:first-child { background: var(--fix); color: var(--fix-text); }
+  .badge { display: inline-block; border-radius: 999px; padding: 0 10px; font-size: .8rem; font-weight: 600; }
+  table.issues td { white-space: normal; vertical-align: top; }
+  table.issues td:first-child, table.issues td:nth-child(2), table.issues td:nth-child(3) { white-space: nowrap; }
+  td.hint { min-width: 220px; }
+  #colTable td { vertical-align: top; white-space: normal; }
+  #colTable td.colname { font-weight: 600; white-space: nowrap; }
+  .desc { display: block; margin-top: 4px; max-width: 280px; }
+  .copts { display: flex; flex-wrap: wrap; gap: 2px 14px; margin-top: 6px; font-size: .88rem; }
+  .copts label { cursor: pointer; white-space: nowrap; }
+  .otitle { font-weight: 600; color: var(--muted); min-width: 7em; }
+  .toggle { display: inline-flex; align-items: center; gap: 8px; font-weight: 600; cursor: pointer; }
+  .toggle input { width: 18px; height: 18px; }
+  tr.off td { color: var(--muted); }
+  tr.off .toggle { font-weight: 400; }
+  .conv { list-style: none; margin: 0; padding: 0; }
+  .conv li { padding: 2px 0; }
+  .before { color: var(--muted); }
+  .arrow { margin: 0 8px; color: var(--muted); }
+  .after { background: var(--changed); color: var(--changed-text); border-radius: 4px; padding: 0 4px; }
+  .after.warn { background: var(--warn); color: var(--warn-text); }
+  .flag { display: block; color: var(--warn-text); }
+  details { margin-top: 16px; }
+  summary { cursor: pointer; font-weight: 600; }
+  .opts { display: flex; flex-wrap: wrap; gap: 12px; margin: 12px 0; }
+  fieldset { border: 1px solid var(--border); border-radius: 8px; padding: 8px 12px; display: flex; flex-direction: column; gap: 2px; }
+  legend { font-size: .85rem; color: var(--muted); padding: 0 4px; }
+  .dictlabel { display: block; margin-bottom: 6px; }
+  .dictlabel small { display: block; }
+  .headline { font-size: 1.05rem; margin: 0 0 12px; }
+  #summary { margin-bottom: 20px; }
+  .tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--border); margin-bottom: 12px; flex-wrap: wrap; }
+  .tabs button { border: none; border-bottom: 2px solid transparent; border-radius: 0; background: none; padding: 8px 12px; }
+  .tabs button[aria-selected=true] { border-bottom-color: var(--accent); font-weight: 600; }
+  .alert { background: var(--warn); color: var(--warn-text); border-radius: 8px; padding: 10px 14px; margin-bottom: 16px; }
+  footer { max-width: 1100px; margin: 0 auto; padding: 8px 16px 32px; color: var(--muted); font-size: .8rem; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Excel データ整形ツール</h1>
+  <p class="lead">電話番号・住所・会社名・ID・メール・ステータス・支払条件・国名の書き方を自動で揃えます。データはこのPCのブラウザ内だけで処理され、外部には送信されません。</p>
+</header>
+
+<main>
+  <div class="alert" id="libError" hidden>Excel 読み込み用のライブラリを取得できませんでした。インターネット接続を確認してページを再読み込みしてください（データ自体は送信されません）。</div>
+
+  <section class="card">
+    <h2><span class="num">1</span>ファイルを読み込む</h2>
+    <label class="drop" id="drop">
+      <input type="file" id="file" accept=".xlsx,.xlsm,.xls,.csv,.tsv,.txt" hidden>
+      <strong>ここにファイルをドラッグ</strong>、またはクリックして選択<br>
+      <small>.xlsx / .xls / .csv（UTF-8・Shift_JIS 対応）</small>
+    </label>
+    <div class="row">
+      <button id="sampleBtn" data-sample="customers">サンプル1（顧客リスト）</button>
+      <button id="sampleBtn2" data-sample="suppliers">サンプル2（仕入先リスト）</button>
+      <span id="fileInfo" class="muted"></span>
+    </div>
+    <div class="row" id="sheetRow" hidden>
+      <label>シート <select id="sheetSel"></select></label>
+      <label>見出しの行 <input type="number" id="headerRow" min="1" value="1"></label>
+    </div>
+  </section>
+
+  <section class="card" id="step2" hidden>
+    <h2><span class="num">2</span>整える列を選ぶ</h2>
+    <p class="muted">チェックの入った列だけを整えます。列の中身を見て自動でチェックしてあるので、右側の「変換イメージ」を見て、整えたくない列はチェックを外してください。</p>
+    <div class="tablewrap">
+      <table id="colTable">
+        <thead><tr><th>列</th><th>整える内容</th><th>変換イメージ（この列の実際の値で表示）</th></tr></thead>
+        <tbody></tbody>
+      </table>
+    </div>
+    <details>
+      <summary>詳細設定（空欄の扱い・元の列・置き換えリスト）</summary>
+      <div class="opts">
+        <fieldset>
+          <legend>値がない所</legend>
+          <label><input type="checkbox" id="blankMissing" checked> 「-」「N/A」「不明」などは空欄にする</label>
+        </fieldset>
+        <fieldset>
+          <legend>列を増やす（通常はオフ）</legend>
+          <label><input type="checkbox" id="keepOriginal"> 整形前の列も残す</label>
+        </fieldset>
+      </div>
+      <label class="dictlabel" for="dict">置き換えリスト（自動では揃わない言い回しを、自分で決めたルールで揃える）
+        <small>1行に「直したい表記=揃えたい表記」と書きます。略称を正式名に揃えるときなどに使います（会社名・大文字小文字・全角半角の列に効きます）。内容はこのブラウザに保存されます。</small>
+      </label>
+      <textarea id="dict" rows="5" placeholder="# 例&#10;GSI=Global Supply Inc&#10;有効=Active"></textarea>
+    </details>
+    <button class="primary" id="runBtn">整形を実行</button>
+  </section>
+
+  <section class="card" id="step3" hidden>
+    <h2><span class="num">3</span>結果を確認してダウンロード</h2>
+    <div id="summary"></div>
+    <div class="tabs" role="tablist" id="tabs"></div>
+    <div id="view"></div>
+  </section>
+</main>
+<footer>ダウンロードするファイルには「整形結果」「確認が必要な所」「変更ログ」「同じ会社の候補」の4シートが入ります。</footer>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const KINDS = [
+  ['phone', '電話番号を揃える', '全角・括弧・+81 などを「03-1234-5678」の形に統一します。'],
+  ['address', '住所の書き方を揃える', '全角数字・ハイフン・「丁目/番地」の書き方を揃え、抜けている都道府県を補います。'],
+  ['company', '会社名の表記を揃える', '㈱→株式会社（または（株））、全角英数→半角、余分な空白の削除などを行います。'],
+  ['id', 'IDの書き方を揃える', '「SUP001」「SUP-2」→「SUP-001」「SUP-002」のように記号と桁数を揃え、重複も見つけます。'],
+  ['email', 'メールアドレスを揃える', '全角・大文字・空白を直し、形式の誤りと重複を見つけます。'],
+  ['category', '大文字・小文字を揃える', '「active」「ACTIVE」→「Active」のように揃えます（ステータスなど）。'],
+  ['payment', '支払条件を揃える', '「30日」「30」「net 30」→「Net30」のように揃えます。'],
+  ['country', '国名をコードに揃える', '「Japan」「日本」「JPN」→「JP」のように国コード（ISO）に揃えます。'],
+  ['text', '全角・半角と空白を揃える', '英数字は半角・カナは全角にし、余分な空白を削除します。'],
+];
+// 列の種類ごとの書き方の選択肢 [設定名, 見出し, [[値, 表示]...]]。先頭の値が既定
+const KIND_OPTIONS = {
+  phone: [
+    ['phoneStyle', 'ハイフン', [['hyphen', 'あり（03-1234-5678）'], ['digits', 'なし（0312345678）']]],
+  ],
+  address: [
+    ['addressStyle', '出力方法', [['joined', '1つのセルにつなげる'], ['spaced', '1つのセルでスペース区切り'], ['split', '6列に分ける']]],
+    ['banchiStyle', '番地の表記', [['hyphen', '1-2-3'], ['keep', '1丁目2番3号（元のまま）']]],
+  ],
+  company: [
+    ['companyStyle', '法人格の表記', [
+      ['full', '株式会社（アリバ商事（株）→ アリバ商事株式会社）'],
+      ['short', '（株）（アリバ商事株式会社 → アリバ商事（株））'],
+    ]],
+    ['companyPosition', '法人格の位置', [
+      ['keep', '元のまま'],
+      ['front', '前に揃える（株式会社アリバ商事）'],
+      ['back', '後ろに揃える（アリバ商事株式会社）'],
+    ]],
+  ],
+  category: [
+    ['caseStyle', '大文字・小文字', [['title', 'Active'], ['upper', 'ACTIVE'], ['lower', 'active']]],
+  ],
+};
+const PREVIEW_LIMIT = 300;
+const DICT_KEY = 'excel-cleaner.dictionary';
+
+const SAMPLES = {};
+SAMPLES.suppliers = [
+  ['SupplierID', 'SupplierName', 'Address', 'Phone', 'Email', 'Status', 'PaymentTerm', 'Country', 'Note'],
+  ['SUP-001', '株式会社アリバ商事', '東京都千代田区丸の内１−２−３', '03-1234-5678', 'info@ariba.example.jp', 'Active', 'Net30', 'JP', ''],
+  ['SUP001', 'アリバ商事（株）', '東京都千代田区丸の内1-2-3', '0312345678', 'info@ariba.example.jp', 'active', '30日', 'Japan', '表記ゆれ'],
+  ['SUP-2', 'ミライ物産株式会社', '大阪府大阪市北区梅田２ー４ー９', '06-6123-4567', 'sales@mirai.example.jp', 'ACTIVE', '30', '日本', ''],
+  ['SUP-003', 'ﾐﾗｲ物産㈱', '大阪府大阪市北区梅田2-4-9', '０６−６１２３−４５６７', 'Sales@Mirai.example.jp', 'Inactive', 'net 30', 'JPN', '重複データ'],
+  ['SUP-004', 'Global Supply Inc', '2550 N First St, SanJose, CA 95131', '+1-408-555-0123', 'contact@globalsupply.example.com', 'Active', 'Net45', 'US', ''],
+  ['SUP004', 'GSI', '2550 N First St, San Jose, CA 95131', '408-555-0123', '', 'pending', '45日', 'USA', 'メール欠損'],
+  ['SUP-005', '株式会社 テスト工業', '東京都新宿区0-0-0', '03-0000-0000', 'test@test.example.jp', 'PENDING', 'Net60', 'JP', '住所異常値'],
+  ['SUP-006', 'Unknown Supplier', '-', '-', '-', 'Inactive', '-', 'JP', ''],
+];
+SAMPLES.customers = [
+  ['会社名', '担当者', '電話番号', '住所'],
+  ['㈱山田商事', '山田 太郎', '03(1234)5678', '〒100-0001 東京都千代田区千代田１－１'],
+  ['山田商事株式会社', '佐藤 花子', '０９０ー１２３４ー５６７８', '東京都港区芝公園4丁目2番8号 東京タワービル3F'],
+  ['（株）ABCシステムズ', '鈴木 一郎', '045-123-4567 内線123', '横浜市西区みなとみらい2-2-1 ランドマークタワー10階'],
+  ['ＡＢＣシステムズ（株）', '高橋 健', '+81 6 1234 5678', '大阪府大阪市北区梅田3丁目1-1'],
+  ['(有)田中工務店', '田中 実', '0466-12-3456', '神奈川県藤沢市藤沢１２３番地'],
+  ['ｻﾝﾌﾟﾙ商会', '伊藤 誠', '312345678', '京都市中京区烏丸通三条上る場之町599番地'],
+  ['合同会社 みらい', '渡辺 翔', '0120-123-456', '北海道札幌市中央区北1条西2丁目1-1 札幌ビル'],
+  ['株式会社　グリーン', '中村 優', '0471234567', '千葉県市川市八幡2-3-4'],
+  ['グリーン　株式会社', '小林 愛', '080-1111-2222 / 03-9876-5432', '千葉県市川市八幡２ー３ー４'],
+  ['四日市運送(株)', '加藤 大輔', '059-123-4567', '三重県四日市市諏訪町1-5'],
+  ['株式会社ブルー', '吉田 恵', '1234', '東京都新宿区市谷本村町5-1'],
+  ['ブルー(株)', '山本 剛', '06-1234-5678', '福岡県福岡市博多区博多駅前2-1-1-501'],
+  ['株式会社レッド', '松本 彩', '09012345678', '愛知県蒲郡市旭町1-1'],
+  ['', '井上 聡', 'TEL:052-123-4567', '港区六本木6丁目10番1号'],
+  ['株式会社ホワイト', '木村 拓', '0465-22-1234', '熊本県阿蘇郡小国町宮原1567-1'],
+];
+
+const state = {
+  // kinds: 列ごとの処理の種類 / enabled: その列を整えるか
+  // colOpts: 列ごとに選んだ出力方法・表記（選んでいないものは KIND_OPTIONS の既定値）
+  wb: null, fileName: '', aoa: [], header: [], rows: [], rowNumbers: [], kinds: [], enabled: [], colOpts: [],
+  result: null, tab: 'preview',
+};
+
+const esc = (s) => String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+
+function storageGet(key) {
+  try { return localStorage.getItem(key) || ''; } catch { return ''; }
+}
+function storageSet(key, value) {
+  try { localStorage.setItem(key, value); } catch { /* 保存できなくても動作には影響しない */ }
+}
+
+/* ---------- 読み込み ---------- */
+
+async function loadFile(file) {
+  if (!window.XLSX) return;
+  const buf = await file.arrayBuffer();
+  let wb;
+  if (/\.(csv|tsv|txt)$/i.test(file.name)) {
+    let text;
+    try {
+      text = new TextDecoder('utf-8', { fatal: true }).decode(buf);
+    } catch {
+      text = new TextDecoder('shift_jis').decode(buf);
+    }
+    // raw: true で「0312345678」などの先頭の0が数値化で消えるのを防ぐ
+    wb = XLSX.read(text.replace(/^﻿/, ''), { type: 'string', raw: true });
+  } else {
+    wb = XLSX.read(buf, { type: 'array' });
+  }
+  state.wb = wb;
+  state.fileName = file.name;
+  $('fileInfo').textContent = `読み込み: ${file.name}`;
+  $('sheetSel').innerHTML = wb.SheetNames.map((n) => `<option>${esc(n)}</option>`).join('');
+  $('sheetRow').hidden = false;
+  loadSheet();
+}
+
+function loadSheet() {
+  const ws = state.wb.Sheets[$('sheetSel').value];
+  state.aoa = XLSX.utils.sheet_to_json(ws, { header: 1, raw: false, defval: '' });
+  applyHeader();
+}
+
+function loadSample(name) {
+  const label = name === 'suppliers' ? '仕入先リスト' : '顧客リスト';
+  state.wb = null;
+  state.fileName = `サンプル_${label}.xlsx`;
+  state.aoa = SAMPLES[name].map((r) => r.slice());
+  $('fileInfo').textContent = `サンプル（${label}）を読み込みました`;
+  $('sheetRow').hidden = true;
+  $('headerRow').value = 1;
+  applyHeader();
+}
+
+function applyHeader() {
+  const h = Math.max(1, parseInt($('headerRow').value, 10) || 1);
+  const width = state.aoa.reduce((w, r) => Math.max(w, r.length), 0);
+  const header = state.aoa[h - 1] || [];
+  state.header = Array.from({ length: width }, (_, i) => String(header[i] ?? '').trim() || `列${i + 1}`);
+  state.rows = [];
+  state.rowNumbers = [];
+  state.aoa.slice(h).forEach((r, i) => {
+    if (r.some((v) => String(v).trim() !== '')) {
+      state.rows.push(Array.from({ length: width }, (_, c) => String(r[c] ?? '')));
+      state.rowNumbers.push(h + i + 1);
+    }
+  });
+  const guessed = state.header.map((name, i) =>
+    Cleaner.guessColumnType(name, state.rows.slice(0, 30).map((r) => r[i])));
+  state.kinds = guessed.map((t) => (t === 'none' ? 'text' : t));
+  state.enabled = guessed.map((t) => t !== 'none');
+  state.colOpts = state.header.map(() => ({}));
+  state.result = null;
+  $('step3').hidden = true;
+  $('fileInfo').textContent += `　${state.rows.length}行 × ${state.header.length}列`;
+  renderColumns();
+}
+
+/* ---------- 列設定 ---------- */
+
+function colOptsFor(i) {
+  const defaults = {};
+  (KIND_OPTIONS[state.kinds[i]] || []).forEach(([key, , choices]) => { defaults[key] = choices[0][0]; });
+  return { ...defaults, ...state.colOpts[i] };
+}
+
+function currentOpts() {
+  return {
+    blankMissing: $('blankMissing').checked,
+    keepOriginal: $('keepOriginal').checked,
+    dictionary: $('dict').value,
+    rowNumbers: state.rowNumbers,
+    columnOptions: state.header.map((_, i) => colOptsFor(i)),
+  };
+}
+
+function kindOptionsHtml(i) {
+  const chosen = colOptsFor(i);
+  return (KIND_OPTIONS[state.kinds[i]] || []).map(([key, title, choices]) => `<div class="copts">
+      <span class="otitle">${title}</span>${choices.map(([v, l]) => `<label><input type="radio" name="o${i}-${key}"
+        data-opt="${key}" data-optcol="${i}" value="${v}"${chosen[key] === v ? ' checked' : ''}> ${l}</label>`).join('')}
+    </div>`).join('');
+}
+
+function convertOne(type, v, opts, dict, idFormat) {
+  const c = Cleaner.convertCell(type, v, opts, dict, idFormat);
+  if (type === 'address' && opts.addressStyle === 'split' && c.parts) {
+    return { value: Cleaner.ADDRESS_PARTS.map(([k]) => c.parts[k]).filter(Boolean).join(' ｜ '), flags: c.flags };
+  }
+  return c;
+}
+
+// 変換で値が変わる例を優先して最大3件見せる
+function columnPreviewHtml(i, type, opts, dict) {
+  const vals = [...new Set(state.rows.map((r) => r[i]).filter((v) => v.trim()))].slice(0, 50);
+  if (!vals.length) return '<span class="muted">（値がありません）</span>';
+  if (type === 'none') return `<span class="muted">${esc(vals.slice(0, 2).join(' ／ '))}　…そのまま出力します</span>`;
+  const idFormat = type === 'id' ? Cleaner.analyzeIds(state.rows.map((r) => r[i])) : null;
+  const conv = vals.map((v) => ({ v, ...convertOne(type, v, opts, dict, idFormat) }));
+  const picked = [...conv.filter((c) => c.value !== c.v), ...conv.filter((c) => c.value === c.v)].slice(0, 3);
+  return `<ul class="conv">${picked.map((c) => `<li>
+      <span class="before">${esc(c.v)}</span><span class="arrow">→</span><span class="after${c.flags.length ? ' warn' : ''}">${c.value ? esc(c.value) : '（空欄）'}</span>
+      ${c.flags.length ? `<small class="flag">⚠ ${esc(c.flags[0])}</small>` : ''}</li>`).join('')}</ul>`;
+}
+
+function renderColumns() {
+  const opts = currentOpts();
+  const dict = Cleaner.parseDictionary(opts.dictionary);
+  $('colTable').tBodies[0].innerHTML = state.header.map((name, i) => {
+    const [, label, desc] = KINDS.find(([v]) => v === state.kinds[i]);
+    const on = state.enabled[i];
+    const detail = on ? `<small class="desc">${desc}</small>${kindOptionsHtml(i)}` : '';
+    return `<tr class="${on ? '' : 'off'}"><td class="colname">${esc(name)}</td>
+      <td><label class="toggle"><input type="checkbox" data-col="${i}"${on ? ' checked' : ''}> ${label}</label>${detail}</td>
+      <td>${columnPreviewHtml(i, on ? state.kinds[i] : 'none', { ...opts, ...colOptsFor(i) }, dict)}</td></tr>`;
+  }).join('');
+  $('step2').hidden = false;
+}
+
+function typesForRun() {
+  return state.kinds.map((k, i) => (state.enabled[i] ? k : 'none'));
+}
+
+/* ---------- 実行 ---------- */
+
+function run() {
+  state.result = Cleaner.processTable(state.header, state.rows, typesForRun(), currentOpts());
+  state.tab = 'preview';
+  renderResult();
+  $('step3').hidden = false;
+  $('step3').scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function renderResult() {
+  const r = state.result;
+  $('summary').innerHTML = `
+    <p class="headline">${state.rows.length}行のうち、<b>${r.changes.length}か所</b>を自動で整えました。</p>
+    <button class="primary" id="dlBtn"${window.XLSX ? '' : ' disabled'}>Excel でダウンロード</button>`;
+
+  const tabs = [
+    ['preview', '整形結果'],
+    ['issues', `確認が必要な所（${r.issues.length}）`],
+    ['dups', `同じ会社の候補（${r.dupGroups.length}）`],
+  ];
+  $('tabs').innerHTML = tabs.map(([id, label]) =>
+    `<button role="tab" data-tab="${id}" aria-selected="${state.tab === id}">${label}</button>`).join('');
+  $('view').innerHTML = state.tab === 'preview' ? previewHtml() : state.tab === 'issues' ? issuesHtml() : dupsHtml();
+}
+
+function previewHtml() {
+  const r = state.result;
+  const idx = r.rows.map((_, i) => i);
+  const shown = idx.slice(0, PREVIEW_LIMIT);
+  const head = `<tr><th>行</th>${r.header.map((h) => `<th>${esc(h)}</th>`).join('')}</tr>`;
+  const body = shown.map((i) => {
+    const cells = r.rows[i].map((v, c) => {
+      const m = r.meta[i][c];
+      if (m && m.changed) return `<td class="changed" title="元の値: ${esc(m.before)}">${esc(v)}</td>`;
+      return `<td>${esc(v)}</td>`;
+    }).join('');
+    return `<tr><td>${state.rowNumbers[i]}</td>${cells}</tr>`;
+  }).join('');
+  const more = idx.length > PREVIEW_LIMIT
+    ? `<p class="muted">先頭 ${PREVIEW_LIMIT} 行だけを表示しています。ダウンロードするファイルには全 ${idx.length} 行が入ります。</p>` : '';
+  return `<div class="tablewrap"><table><thead>${head}</thead><tbody>${body}</tbody></table></div>${more}`;
+}
+
+function issuesHtml() {
+  const list = state.result.issues;
+  if (!list.length) return '<p class="muted">確認が必要な所はありません。</p>';
+  const body = list.map((x) =>
+    `<tr><td><span class="badge lv-${x.level}">${Cleaner.LEVEL_LABEL[x.level]}</span></td>
+      <td>${x.row}</td><td>${esc(x.column)}</td><td>${esc(x.value)}</td><td>${esc(x.reason)}</td>
+      <td class="hint">${esc(x.hint)}</td></tr>`).join('');
+  return `<p class="muted">「行」は元のExcelの行番号です。ダウンロードしたファイルの「確認が必要な所」シートにも同じ一覧が入ります。</p>
+    <div class="tablewrap"><table class="issues"><thead><tr><th>種類</th><th>行</th><th>列</th><th>元の値</th><th>何があったか</th><th>どうすればいいか</th></tr></thead>
+    <tbody>${body}</tbody></table></div>`;
+}
+
+function dupsHtml() {
+  const groups = state.result.dupGroups;
+  if (!groups.length) return '<p class="muted">同じ会社かもしれない名前は見つかりませんでした。</p>';
+  const body = groups.map((g, gi) => g.items.map((x, k) =>
+    `<tr>${k === 0 ? `<td rowspan="${g.items.length}">${gi + 1}</td><td rowspan="${g.items.length}">${g.kind}</td>` : ''}
+      <td>${x.row}</td><td>${esc(x.before)}</td><td>${esc(x.after)}</td></tr>`).join('')).join('');
+  return `<p class="muted">「株式会社」の位置や空白・全角/半角の違いを無視すると同じになる会社名です。同じ取引先なら、どちらかの書き方に揃えてください（「置き換えリスト」に登録すると次回から自動で揃います）。</p>
+    <div class="tablewrap"><table><thead><tr><th>グループ</th><th>種類</th><th>行</th><th>元の値</th><th>整形後</th></tr></thead>
+    <tbody>${body}</tbody></table></div>`;
+}
+
+/* ---------- 出力 ---------- */
+
+function sheetFrom(aoa) {
+  const ws = XLSX.utils.aoa_to_sheet(aoa);
+  ws['!cols'] = aoa[0].map((_, c) => ({
+    wch: Math.min(50, Math.max(8, ...aoa.slice(0, 200).map((r) => String(r[c] ?? '').length * 2))),
+  }));
+  if (aoa.length > 1) ws['!autofilter'] = { ref: ws['!ref'] };
+  return ws;
+}
+
+function download() {
+  if (!window.XLSX) return;
+  const r = state.result;
+  const wb = XLSX.utils.book_new();
+  XLSX.utils.book_append_sheet(wb, sheetFrom([r.header, ...r.rows]), '整形結果');
+  XLSX.utils.book_append_sheet(wb, sheetFrom([['種類', '行', '列', '元の値', '何があったか', 'どうすればいいか'],
+    ...r.issues.map((x) => [Cleaner.LEVEL_LABEL[x.level], x.row, x.column, x.value, x.reason, x.hint])]), '確認が必要な所');
+  XLSX.utils.book_append_sheet(wb, sheetFrom([['行', '列', '変更前', '変更後'], ...r.changes.map((x) => [x.row, x.column, x.before, x.after])]), '変更ログ');
+  XLSX.utils.book_append_sheet(wb, sheetFrom([['グループ', '種類', '列', '行', '元の値', '整形後'],
+    ...r.dupGroups.flatMap((g, gi) => g.items.map((x) => [gi + 1, g.kind, g.column, x.row, x.before, x.after]))]), '同じ会社の候補');
+  const base = state.fileName.replace(/\.[^.]+$/, '');
+  XLSX.writeFile(wb, `${base}_整形済み.xlsx`);
+}
+
+/* ---------- イベント ---------- */
+
+if (!window.XLSX) $('libError').hidden = false;
+$('dict').value = storageGet(DICT_KEY);
+$('dict').addEventListener('input', () => {
+  storageSet(DICT_KEY, $('dict').value);
+  if (state.header.length) renderColumns();
+});
+document.querySelectorAll('#blankMissing').forEach((el) =>
+  el.addEventListener('change', () => state.header.length && renderColumns()));
+
+$('file').addEventListener('change', (e) => e.target.files[0] && loadFile(e.target.files[0]));
+const drop = $('drop');
+drop.addEventListener('dragover', (e) => { e.preventDefault(); drop.classList.add('over'); });
+drop.addEventListener('dragleave', () => drop.classList.remove('over'));
+drop.addEventListener('drop', (e) => {
+  e.preventDefault();
+  drop.classList.remove('over');
+  if (e.dataTransfer.files[0]) loadFile(e.dataTransfer.files[0]);
+});
+[$('sampleBtn'), $('sampleBtn2')].forEach((b) => b.addEventListener('click', () => loadSample(b.dataset.sample)));
+$('sheetSel').addEventListener('change', loadSheet);
+$('headerRow').addEventListener('change', applyHeader);
+$('colTable').addEventListener('change', (e) => {
+  const { col, opt, optcol } = e.target.dataset;
+  if (opt != null) state.colOpts[+optcol][opt] = e.target.value;
+  else if (col != null) state.enabled[+col] = e.target.checked;
+  else return;
+  renderColumns();
+});
+$('runBtn').addEventListener('click', run);
+$('summary').addEventListener('click', (e) => {
+  if (e.target.closest('#dlBtn')) download();
+});
+$('tabs').addEventListener('click', (e) => {
+  const tab = e.target.dataset.tab;
+  if (tab) { state.tab = tab; renderResult(); }
+});
+</script>
+</body>
+</html>
